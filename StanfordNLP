@@ -1,0 +1,280 @@
+StanfordCoreNLP_Pipeline <-
+function(annotators = c("pos", "lemma"), language = "en", control = list())
+{
+
+    if(language == "en") {
+        ## Use a 'natural' order which meets all dependencies.
+        table <- c("tokenize", "cleanxml", "ssplit", "pos", "lemma",
+                   "gender", "ner", "regexner", "truecase", "parse",
+                   "sentiment", "dcoref", "relation")
+
+        ## Some annotators need others, but StanfordCoreNLP does not add
+        ## these dependencies: hence, we try doing this on our end.
+        ## See <http://stanfordnlp.github.io/CoreNLP/dependencies.html>.
+        ## <FIXME>
+        ## This is not quite right: e.g. natlog can use depparse instead
+        ## of parse.  Improve to allow for alternatives eventually ...
+        depends <-
+            list(cleanxml =
+                     c("tokenize"),
+                 pos =
+                     c("tokenize", "ssplit"),
+                 lemma =
+                     c("tokenize", "ssplit", "pos"),
+                 ner =
+                     c("tokenize", "ssplit", "pos", "lemma"),
+                 regexner =
+                     c("tokenize", "ssplit", "pos"),
+                 sentiment =
+                     c("pos", "parse"),
+                 parse =
+                     c("tokenize", "ssplit", "pos"),
+                 depparse =
+                     c("tokenize", "ssplit", "pos"),
+                 dcoref =
+                     c("tokenize", "ssplit", "pos", "lemma", "ner", "parse"),
+                 relation =
+                     c("tokenize", "ssplit", "pos", "lemma", "ner", "parse"),
+                 natlog =
+                     c("tokenize", "ssplit", "pos", "lemma", "parse"),
+                 ## Not on the HTML page ...
+                 gender = c("tokenize", "ssplit", "pos"),
+                 truecase = c("tokenize", "ssplit", "pos", "lemma")
+                 )
+        pos <- pmatch(tolower(annotators), table)
+        if(any(ind <- is.na(pos)))
+            stop(sprintf("No unique match for annotator(s) %s",
+                         paste(sQuote(annotators[ind]), collapse = " ")))
+        
+        annotators <-
+            intersect(table,
+                      c("tokenize", "ssplit",
+                        table[pos], unlist(depends[table[pos]])))
+        ## </FIXME>
+
+        props <- .jnew("java/util/Properties")
+        .jcall(props, "Ljava/lang/Object;", "setProperty",
+               "annotators", paste(annotators, collapse = ", "))
+    } else {
+        pname <- paste0("StanfordCoreNLPjars.", language)
+        if(!requireNamespace(pname))
+            stop(sprintf("No support for language %s",
+                         sQuote(language)))
+        ## For now, hard-wire the annotators to what the .properties
+        ## file contains.
+        pfile <- Sys.glob(file.path(system.file("java",
+                                                package = pname),
+                                    "*.properties"))
+        ## (Seems there is no direct way to find where a loaded
+        ## namespace was found?)
+        vals <- read_dot_properties(pfile)
+        keys <- names(vals)
+        props <- .jnew("java/util/Properties")
+        for(i in seq_along(keys)) {
+            .jcall(props, "Ljava/lang/Object;", "setProperty",
+                   keys[i], vals[i])
+        }
+
+    }
+
+    control <- as.list(control)
+    if(n <- length(control)) {
+        tags <- names(control)
+        vals <- lapply(control, as.character)
+        if((length(tags) != n) || anyNA(tags) || any(tags == ""))
+            stop("Invalid 'control' argument.")
+        for(i in seq_along(control)) {
+                .jcall(props, "Ljava/lang/Object;", "setProperty",
+                       tags[i], vals[[i]])
+            }
+    }
+    
+    f <- function(s, a = NULL) {
+        
+        ## <TODO>
+        ## Add full support for
+        ##   gender truecase relation
+        ## Annotator gender is mentioned in the reference, but does not
+        ## seem to provide any annotations and there is no example ...
+        ## Similarly, there are no examples for the other two.
+        ## </TODO>
+        
+        s <- as.String(s)
+
+        
+        bos <- .jnew("java/io/ByteArrayOutputStream")
+        err <- .jfield("java/lang/System", , "err")
+        .jcall("java/lang/System", "V", "setErr",
+               .jnew("java/io/PrintStream",
+                     .jcast(bos,"java/io/OutputStream")))
+
+        pipeline <-
+            .jnew("edu/stanford/nlp/pipeline/StanfordCoreNLP", props)
+
+       
+        document <- .jnew("edu/stanford/nlp/pipeline/Annotation", s)
+
+        pipeline$annotate(document)
+
+        bos <- .jnew("java/io/ByteArrayOutputStream")
+        pipeline$xmlPrint(document, bos)
+        out <- .jcall(bos, "Ljava/lang/String;", "toString")
+
+        doc <- read_xml(out)
+
+        tags <- c("POS", "lemma", "NER", "NormalizedNER")
+        ## <Timex> would also need attributes ...
+
+        fun <- function(si, pi, offset) {
+            start <-
+                as.integer(vapply(si, `[[`, "", "CharacterOffsetBegin")) + 1L
+            end <-
+                as.integer(vapply(si, `[[`, "", "CharacterOffsetEnd"))
+            len <- length(end)
+            id <- seq.int(offset, offset + len)
+            Annotation(id,
+                       c("sentence", rep.int("word", len)),
+                       c(min(start), start),
+                       c(max(end), end),
+                       c(list(c(list(constituents = tail(id, -1L)),
+                                pi)),
+                         lapply(si,
+                                function(e) e[intersect(tags, names(e))])))
+        }
+
+        y <- xpath_apply(doc, "//sentences/sentence", info_for_sentence)
+        z <- if(!is.na(match("parse", annotators))) {
+            Map(c,
+                xpath_apply(doc, "//sentences/sentence/parse",
+                           function(e) list(parse = xml_text(e))),
+                xpath_apply(doc, "//sentences/sentence",
+                           sentence_dependencies))
+                           
+        } else {
+            vector("list", length(y))
+        }
+        if(!is.na(match("sentiment", annotators)))
+            z <- Map(c, z,
+                     xpath_apply(doc, "//sentences/sentence",
+                                function(e)
+                                as.list(xml_attrs(e)[c("sentimentValue",
+                                                       "sentiment")])))
+        offsets <- cumsum(1L + c(0, head(lengths(y), -1L)))
+        y <- do.call(c, Map(fun, y, z, offsets))
+
+     
+        if((language == "en") && !is.na(match("pos", annotators))) {
+            meta(y, "POS_tagset") <- "en-ptb"
+            meta(y, "POS_tagset_URL") <-
+                "http://www.comp.leeds.ac.uk/ccalas/tagsets/upenn.html"
+        }
+
+        if(!is.na(match("dcoref", annotators))) {
+            coreferences <- 
+                xpath_apply(doc, "//coreference/coreference",
+                            info_for_coreferences)
+            
+            y <- merge(y,
+                       Annotation(next_id(y$id),
+                                  "document",
+                                  1L,
+                                  nchar(s),
+                                  list(list(coreferences =
+                                            coreferences))))
+            ## </NOTE>
+        }
+                              
+        y
+    }
+
+    description <-
+        sprintf("Computes annotations using a Stanford CoreNLP annotator pipeline with the following annotators: %s.",
+                paste(annotators, collapse = ", "))
+
+    Annotator(f, list(description = description))
+}
+
+info_for_token <-
+function(x)
+{
+    kids <- xml_children(x)
+    y <- xml_text(kids)
+    names(y) <- xml_name(kids)
+    c(xml_attr(x, "id"), y)
+}  
+
+info_for_sentence <-
+function(x)
+{
+    xpath_apply(x, "./tokens/token", info_for_token)
+}
+
+sentence_dependencies <-
+function(x) {
+    y <- xpath_apply(x, "./dependencies", info_for_dependencies)
+    names(y) <- xml_attr(xml_find_all(x, "./dependencies"), "type")
+    y
+}
+
+info_for_dependencies <-
+function(x)
+{
+    y <- data.frame(type =
+                        xml_attr(xml_find_all(x, "./dep"), "type"),
+                    gid =
+                        as.integer(xml_attr(xml_find_all(x, "./dep/governor"),
+                                            "idx")),
+                    governor =
+                        xml_text(xml_find_all(x, "./dep/governor")),
+                    did = 
+                        as.integer(xml_attr(xml_find_all(x, "./dep/dependent"),
+                                            "idx")),
+                    dependent =
+                        xml_text(xml_find_all(x, "./dep/dependent")),
+                    stringsAsFactors = FALSE)
+    class(y) <- c("Stanford_typed_dependencies", class(y))
+    y
+}
+
+format.Stanford_typed_dependencies <-
+function(x, ...)
+    sprintf("%s(%s-%s, %s-%s)",
+            x$type, x$governor, x$gid, x$dependent, x$did)
+
+print.Stanford_typed_dependencies <-
+function(x, ...)
+{
+    writeLines(format(x))
+    invisible(x)
+}
+
+info_for_coreferences <-
+function(x)
+{
+    f <- function(x, p) as.integer(xml_text(xml_find_all(x, p)))
+    y <- data.frame(sentence = f(x, "./mention/sentence"),
+                    start = f(x, "./mention/start"),
+                    end = f(x, "./mention/end"),
+                    head = f(x, "./mention/head"))
+    a <- xml_attr(xml_find_all(x, "./mention"), "representative")
+    cbind(representative = !vapply(a, is.na, NA), y)
+}
+
+read_dot_properties <-
+function(file)
+{
+    ## A simple reader for the .properties files used by Stanford
+    ## CoreNLP.
+    ## See <https://en.wikipedia.org/wiki/.properties>.
+    lines <- readLines(file, warn = FALSE)
+    Encoding(lines) <- "UTF-8"
+    lines <- lines[!grepl("^[[:space:]]*$", lines)]
+    keys <- trimws(sub("(^[^=]*)=.*", "\\1", lines))
+    values <- trimws(sub("^[^=]*= *", "", lines))
+    names(values) <- keys
+    values
+}
+
+xpath_apply <-
+function(x, p, FUN, ...)
+    lapply(xml_find_all(x, p), FUN, ...)
